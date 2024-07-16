@@ -387,9 +387,40 @@ module Resque
 
     def maintain_worker_count
       all_known_queues.each do |queues|
-        delta = worker_delta_for(queues)
-        spawn_missing_workers_for(queues) if delta > 0
-        quit_excess_workers_for(queues)   if delta < 0
+        # How many workers we have configured
+        required_workers = config.fetch(queues, 0)
+
+        # Workers this process has spawned
+        local_pids = workers.fetch(queues, []).map(&:first)
+
+        if local_pids.size > required_workers
+          # There's more worker than we need, just kill some
+          quit_excess_workers_for(queues, local_pids.size - required_workers)
+        elsif local_pids.size < required_workers
+          # We need to create more workers, but we wanna make sure to honor the
+          # configured limit across any running resque pool instance.
+          # This will ensure we never have more workers than required during releases.
+
+          # We get the actual workers number from Redis, and cache it so it can be reused
+          # for the other queues.
+          real_workers_per_queue ||= Resque::Worker.all
+                                                   .group_by{|x| x.instance_variable_get(:@queues).join(',')}
+                                                   .to_h {|x, y| [x, y.map(&:pid)]}
+          real_pids = real_workers_per_queue.fetch(queues, [])
+
+          # Workers across different resque pool instances
+          total_workers_count =  (real_pids | local_pids).size
+          to_spawn =  required_workers - total_workers_count
+
+          if to_spawn > 0
+            log "Detected #{to_spawn} workers to spawn!"
+            log "QUEUE: #{queues} Req: #{required_workers} Loc: #{local_pids.size} Real: #{real_pids.size} Union: #{total_workers_count} ToSp: #{to_spawn}"
+            log "Local Pids: #{local_pids}"
+            log "Real Pids: #{real_pids}"
+          end
+
+          spawn_missing_workers_for(queues, to_spawn) if to_spawn > 0
+        end
       end
     end
 
@@ -401,22 +432,20 @@ module Resque
     # methods that operate on a single grouping of queues {{{
     # perhaps this means a class is waiting to be extracted
 
-    def spawn_missing_workers_for(queues)
-      worker_delta_for(queues).times do |nr|
+    def spawn_missing_workers_for(queues, n)
+      log "Spawning #{n} workers for #{queues}"
+      n.times do |nr|
         spawn_worker!(queues)
         sleep Resque::Pool.spawn_delay if Resque::Pool.spawn_delay
       end
     end
 
-    def quit_excess_workers_for(queues)
-      delta = -worker_delta_for(queues)
-      pids_for(queues)[0...delta].each do |pid|
+    def quit_excess_workers_for(queues, n)
+      log "Killing #{n} workers for #{queues}"
+
+      pids_for(queues)[0...n].each do |pid|
         Process.kill("QUIT", pid)
       end
-    end
-
-    def worker_delta_for(queues)
-      config.fetch(queues, 0) - workers.fetch(queues, []).size
     end
 
     def pids_for(queues)
